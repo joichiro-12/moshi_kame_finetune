@@ -1,4 +1,5 @@
 import argparse
+import json
 from copy import deepcopy
 
 import torch
@@ -100,8 +101,24 @@ def _load_moshi_lm_lenient(model_path: str, device: str = "cpu") -> tuple["LMMod
     return lm, oracle_emb_missing
 
 
+def _load_moshi_lm_kwargs(moshi_lm_repo: str) -> dict:
+    """Load moshi_lm_kwargs from HF repo if available, else fall back to kame defaults.
+
+    Allows non-standard architectures (e.g. J-Moshi) to supply their own config.
+    """
+    try:
+        kwargs_path = hf_hub_download(moshi_lm_repo, "moshi_lm_kwargs.json")
+        with open(kwargs_path) as f:
+            kwargs = json.load(f)
+        print(f"[INFO] Loaded moshi_lm_kwargs from {moshi_lm_repo}/moshi_lm_kwargs.json")
+        return kwargs
+    except Exception:
+        print("[INFO] moshi_lm_kwargs.json not found in HF repo; using kame package defaults")
+        return deepcopy(loaders._lm_kwargs)
+
+
 def main(args):
-    moshi_lm_kwargs = deepcopy(loaders._lm_kwargs)
+    moshi_lm_kwargs = _load_moshi_lm_kwargs(args.moshi_lm_repo)
 
     # Use lenient loading to handle models without oracle_emb
     model_path = hf_hub_download(args.moshi_lm_repo, args.moshi_lm_name)

@@ -28,6 +28,13 @@ license-files = ["LICENSE*"]
 oracle = [
     "openai>=1.93.0",
 ]
+data = [
+    "datasets>=2.14.0",
+    "whisperx @ git+https://github.com/m-bain/whisperX.git",
+]
+server-jp = [
+    "google-cloud-speech>=2.0.0",
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu121"

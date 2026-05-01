@@ -15,8 +15,75 @@ from tools.oracle_generation import (
 
 DEFAULT_MODEL_NAME = "gpt-4.1-nano"
 
+SYSTEM_PROMPT_EN = (
+    "You are a helpful assistant that predicts the next response in a spoken conversation."
+)
+SYSTEM_PROMPT_JA = (
+    "あなたは会話の次の発話を予測する優秀なアシスタントです。"
+    "自然な口語日本語で簡潔に回答してください。"
+)
+
+
+def build_user_prompt_ja(request: OraclePredictionRequest) -> str:
+    """日本語版 oracle プロンプト（Table 1 の hint level に対応）。"""
+    if request.current_spoken_ratio <= 0.5:
+        prompt = f"""あなたは会話の次の発話を予測します。
+
+これまでの会話:
+{request.conversation_context}
+
+現在の話者（{request.current_speaker}）はまだ発話の途中です（進捗: {request.current_spoken_ratio:.0%}）。
+次に{request.next_speaker}が何を言うか予測してください。
+
+会話の流れのみを参考にして、自然な続きを予測してください。"""
+    else:
+        prompt = f"""あなたは会話の次の発話を予測します。
+
+これまでの会話:
+{request.conversation_context}
+
+現在の話者（{request.current_speaker}）の発話進捗: {request.current_spoken_ratio:.0%}
+次に{request.next_speaker}が何を言うか予測してください。
+
+ヒント（直接引用・言及しないこと。内容を参考にして自分の言葉で予測すること）:
+実際の次の発話は次のような内容になります: 「{request.next_utterance_hint}」
+
+発話進捗 {request.current_spoken_ratio:.1%} に応じたガイドライン:"""
+
+        if request.current_spoken_ratio <= 0.65:
+            prompt += """
+- まだ発話の前半です。会話の流れを優先してください。
+- ヒントのキーワードは参考程度に使い、ヒントに沿いすぎないようにしてください。"""
+        elif request.current_spoken_ratio <= 0.8:
+            prompt += """
+- 発話の後半に入っています。会話の流れを踏まえつつヒントを参照してください。
+- ヒントとは異なる表現も一部取り入れてください。"""
+        elif request.current_spoken_ratio <= 0.95:
+            prompt += """
+- 発話がほぼ完了しています。ヒントは重要な手がかりです。
+- ヒントをそのまま写さず、自然な言い方に変えてください。"""
+        elif request.current_spoken_ratio <= 0.99:
+            prompt += """
+- 発話の終盤です。ヒントをより直接的に参照しながら自然な予測を生成してください。"""
+        else:
+            prompt += """
+- 発話がほぼ終了しました。最も自然な続きとしてヒントに近い内容で構いません。"""
+
+    prompt += f"""
+
+重要な制約:
+- 自信を持って回答し、確認を求めないこと
+- できるだけ30語以内・最低10語の口語日本語で回答すること
+- 箇条書き・引用符・説明文を含めないこと
+- テキスト書式や読点・句点以外の記号を使わないこと
+- {request.next_speaker}が実際に言いそうな発話テキストだけを出力すること
+
+予測した発話テキストのみを出力してください。"""
+    return prompt
+
 
 def prediction_to_record(prediction: OraclePrediction) -> dict[str, object]:
+
     return {
         "timestamp_ms": prediction.timestamp_ms,
         "conversation_context": prediction.conversation_context,
@@ -110,28 +177,31 @@ def make_openai_predict_fn(
     *,
     model_name: str,
     fallback_to_hint_on_error: bool = False,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    language: str = "en",
 ):
     from openai import OpenAI
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+    resolved_api_key = api_key or os.getenv("OPENAI_API_KEY")
+    if not resolved_api_key and base_url is None:
         raise ValueError("OPENAI_API_KEY environment variable is not set")
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(
+        api_key=resolved_api_key or "EMPTY",
+        base_url=base_url,
+    )
+
+    system_prompt = SYSTEM_PROMPT_JA if language == "ja" else SYSTEM_PROMPT_EN
+    prompt_fn = build_user_prompt_ja if language == "ja" else build_user_prompt
 
     def predict(request: OraclePredictionRequest) -> str:
         try:
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a helpful assistant that predicts the next response in a "
-                            "spoken conversation."
-                        ),
-                    },
-                    {"role": "user", "content": build_user_prompt(request)},
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt_fn(request)},
                 ],
                 stream=False,
             )
@@ -195,6 +265,9 @@ def main(args: argparse.Namespace) -> None:
     predict_fn = make_openai_predict_fn(
         model_name=args.model,
         fallback_to_hint_on_error=args.fallback_to_hint_on_error,
+        base_url=args.llm_base_url or None,
+        api_key=args.llm_api_key or None,
+        language=args.language,
     )
 
     text_paths = sorted(Path(args.text_dir).glob("*.json"))
@@ -235,4 +308,29 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--fallback_to_hint_on_error", action="store_true")
+    parser.add_argument(
+        "--language",
+        type=str,
+        default="en",
+        choices=["en", "ja"],
+        help="Language for oracle prompts. Use 'ja' for Japanese.",
+    )
+    parser.add_argument(
+        "--llm_base_url",
+        type=str,
+        default="",
+        help=(
+            "Custom LLM base URL (e.g. http://localhost:8000/v1 for vLLM). "
+            "Leave empty to use the standard OpenAI endpoint."
+        ),
+    )
+    parser.add_argument(
+        "--llm_api_key",
+        type=str,
+        default="",
+        help=(
+            "API key for the LLM endpoint. Falls back to OPENAI_API_KEY env var. "
+            "Set to 'EMPTY' for local vLLM servers that require a placeholder key."
+        ),
+    )
     main(parser.parse_args())
