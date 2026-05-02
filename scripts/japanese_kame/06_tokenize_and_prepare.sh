@@ -24,7 +24,7 @@ OUTPUT_PREFIX="${OUTPUT_PREFIX:-processed_data/japanese_kame/train_text_oracle_a
 # J-Moshi uses rinna/japanese-gpt2-medium SentencePiece.
 # Confirm the exact filename by checking nu-dialogue/j-moshi-ext on HuggingFace.
 TEXT_TOKENIZER_REPO="${TEXT_TOKENIZER_REPO:-nu-dialogue/j-moshi-ext}"
-TEXT_TOKENIZER_NAME="${TEXT_TOKENIZER_NAME:-tokenizer_spm_32k.model}"
+TEXT_TOKENIZER_NAME="${TEXT_TOKENIZER_NAME:-tokenizer_spm_32k_3.model}"
 
 NUM_WORKERS="${NUM_WORKERS:-8}"
 

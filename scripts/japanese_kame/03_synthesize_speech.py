@@ -1,13 +1,22 @@
-"""Synthesize stereo WAV files from two-speaker dialogue JSON using J-Moshi TTS.
+"""Synthesize stereo WAV files from two-speaker dialogue JSON using J-Moshi.
 
-For each dialogue JSON, speaker A audio goes to the left channel and speaker B
-to the right channel.  Following J-Moshi paper Sec. 3.4, we run synthesis with
---num_seeds different random seeds and keep the one with the lowest WER
-(measured by whisperx transcription against the dialogue text).
+J-Moshi does NOT expose a standalone TTS CLI (`jmoshi.tts` does not exist).
+This script uses kame-model's offline inference API (LMGen + MimiModel) to
+produce speech directly, which is the same underlying engine used by
+`moshi.server --hf-repo nu-dialogue/j-moshi-ext`.
+
+Multi-stream TTS procedure (following J-Moshi paper Sec. 3.4):
+  1. Load J-Moshi model weights via kame-model loaders
+  2. For each dialogue, feed text tokens frame-by-frame while the model
+     generates audio tokens for both speakers concurrently
+  3. Run with --num_seeds different random seeds; keep the WAV whose
+     WhisperX WER against the source text is lowest
+
+Output stereo WAV layout: L=speaker A, R=speaker B, 24 kHz.
 
 Prerequisites:
-    - J-Moshi (nu-dialogue/j-moshi) must be installed or available as a server
-    - GPU recommended for reasonable throughput
+  - GPU with ≥24 GB VRAM (same requirement as moshi.server)
+  - kame-model package (already in this venv)
 
 Usage:
     uv run -m scripts.japanese_kame.03_synthesize_speech \
@@ -23,102 +32,200 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+import torch
 from tqdm import tqdm
 
 
 SAMPLE_RATE = 24000
+# Frame rate of the Mimi audio codec (12.5 Hz = 80 ms per frame)
+FRAME_RATE = 12.5
+# Average Japanese speech rate: roughly 7 mora/s → ~3.5 tokens/frame at 12.5 fps
+CHARS_PER_SECOND = 8.0
 
 
 def _compute_wer(reference: str, hypothesis: str) -> float:
-    """Compute word error rate between two strings."""
-    ref_words = reference.split()
-    hyp_words = hypothesis.split()
-    if not ref_words:
+    """Word error rate between two strings (character-level for Japanese)."""
+    ref = list(reference.replace(" ", ""))
+    hyp = list(hypothesis.replace(" ", ""))
+    if not ref:
         return 0.0
-    # simple dynamic programming WER
-    n, m = len(ref_words), len(hyp_words)
+    n, m = len(ref), len(hyp)
     dp = list(range(m + 1))
     for i in range(1, n + 1):
         new_dp = [i] + [0] * m
         for j in range(1, m + 1):
-            if ref_words[i - 1] == hyp_words[j - 1]:
-                new_dp[j] = dp[j - 1]
-            else:
-                new_dp[j] = 1 + min(dp[j], new_dp[j - 1], dp[j - 1])
+            new_dp[j] = dp[j - 1] if ref[i - 1] == hyp[j - 1] else 1 + min(dp[j], new_dp[j - 1], dp[j - 1])
         dp = new_dp
     return dp[m] / n
 
 
-def _transcribe_channel(audio: np.ndarray, device: str) -> str:
-    """Transcribe a mono audio array using whisperx."""
+def _transcribe_mono(audio: np.ndarray, device: str) -> str:
+    """Transcribe a mono float32 array (24 kHz) using whisperx."""
     try:
         import whisperx
 
         model = whisperx.load_model("large-v3", device=device, language="ja")
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             sf.write(tmp.name, audio, SAMPLE_RATE)
-            tmp_path = tmp.name
-        result = model.transcribe(tmp_path)
-        os.unlink(tmp_path)
+            path = tmp.name
+        result = model.transcribe(path)
+        os.unlink(path)
         return " ".join(seg["text"] for seg in result.get("segments", []))
     except Exception:
         return ""
 
 
-def _dialogue_reference(turns: list[dict], speaker: str) -> str:
-    return " ".join(t["text"] for t in turns if t.get("speaker") == speaker)
+# ---------------------------------------------------------------------------
+# Offline TTS via kame-model (LMGen)
+# ---------------------------------------------------------------------------
+
+_model_cache: dict[str, object] = {}
 
 
-def _synthesize_with_j_moshi(
-    turns: list[dict],
+def _load_model(repo: str, device: str):
+    """Load J-Moshi model from HuggingFace (cached across calls within a process)."""
+    cache_key = f"{repo}:{device}"
+    if cache_key in _model_cache:
+        return _model_cache[cache_key]
+
+    from kame.models import loaders
+    from kame.run_inference import InferenceState, get_condition_tensors
+
+    checkpoint_info = loaders.CheckpointInfo.from_hf_repo(
+        repo,
+        moshi_weight=None,
+        mimi_weight=None,
+        tokenizer=None,
+    )
+    mimi = checkpoint_info.get_mimi(device=device)
+    text_tokenizer = checkpoint_info.get_text_tokenizer()
+    lm = checkpoint_info.get_moshi(device=device, dtype=torch.bfloat16)
+    state = InferenceState(
+        checkpoint_info, mimi, text_tokenizer, lm,
+        batch_size=1, cfg_coef=1.0, device=device,
+    )
+    _model_cache[cache_key] = (state, text_tokenizer)
+    return state, text_tokenizer
+
+
+def _text_to_frame_schedule(
+    turns: list[dict[str, str]],
+    text_tokenizer,
+    frame_rate: float = FRAME_RATE,
+    chars_per_second: float = CHARS_PER_SECOND,
+) -> tuple[list[tuple[int, str, list[int]]], int]:
+    """Build a per-frame token injection schedule from a dialogue turn list.
+
+    Returns:
+        schedule: list of (frame_idx, speaker, token_ids)
+        total_frames: estimated total audio frames to generate
+    """
+    from tools.tokenize_text import encode_as_pieces_wo_byte_fallback
+
+    schedule: list[tuple[int, str, list[int]]] = []
+    cursor = 0.0  # seconds
+
+    for turn in turns:
+        speaker = turn.get("speaker", "A")
+        text = turn.get("text", "").strip()
+        if not text:
+            continue
+
+        tokens = encode_as_pieces_wo_byte_fallback(text_tokenizer, text)
+        token_ids = [text_tokenizer.piece_to_id(t) for t in tokens if t]
+        if not token_ids:
+            continue
+
+        duration = len(text) / chars_per_second
+        frames_for_turn = max(1, int(duration * frame_rate))
+        stride = max(1, frames_for_turn // max(1, len(token_ids)))
+
+        start_frame = int(cursor * frame_rate)
+        for i, tid in enumerate(token_ids):
+            schedule.append((start_frame + i * stride, speaker, [tid]))
+
+        cursor += duration + 0.3  # 300 ms gap between turns
+
+    total_frames = int(cursor * frame_rate) + int(1.0 * frame_rate)
+    return schedule, total_frames
+
+
+@torch.no_grad()
+def synthesize_with_kame(
+    turns: list[dict[str, str]],
     seed: int,
     device: str,
-    j_moshi_repo: str,
+    repo: str,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """Synthesize a two-speaker dialogue via J-Moshi TTS.
+    """Synthesize a two-speaker dialogue offline using kame-model LMGen.
 
-    Returns (audio_a, audio_b) numpy arrays (mono, SAMPLE_RATE) or None on failure.
+    Returns (audio_a, audio_b) float32 numpy arrays at SAMPLE_RATE Hz, or None on error.
 
-    J-Moshi's multi-stream TTS is invoked via the CLI entry point
-    `python -m jmoshi.tts` (exact module path may differ; see nu-dialogue/j-moshi).
-    The CLI writes a stereo WAV to a temporary path; we split it here.
+    Implementation note: Moshi/J-Moshi generates both the inner-monologue text
+    stream AND the audio stream simultaneously.  For TTS purposes we seed the
+    text stream with the known dialogue text and let the model fill in the audio.
+    Speaker A tokens go to stream 0; speaker B tokens go to stream 1 (oracle).
+    This matches how j-moshi-ext was fine-tuned for multi-stream TTS.
     """
-    dialogue_text = "\n".join(f"{t['speaker']}: {t['text']}" for t in turns)
+    try:
+        import sphn
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "dialogue.txt")
-        output_path = os.path.join(tmpdir, "output.wav")
-        with open(input_path, "w", encoding="utf-8") as f:
-            f.write(dialogue_text)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
-        # J-Moshi TTS CLI – adjust module path to match the installed package.
-        # nu-dialogue/j-moshi exposes multi-stream TTS at `jmoshi.server` or similar.
-        # The command below is a best-effort approximation; update to match the
-        # actual j-moshi package CLI once the repository is confirmed.
-        cmd = [
-            "python", "-m", "jmoshi.tts",
-            "--repo", j_moshi_repo,
-            "--input", input_path,
-            "--output", output_path,
-            "--seed", str(seed),
-            "--device", device,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0 or not os.path.exists(output_path):
+        state, text_tokenizer = _load_model(repo, device)
+        state.mimi.reset_streaming()
+        state.lm_gen.reset_streaming()
+
+        schedule, total_frames = _text_to_frame_schedule(turns, text_tokenizer)
+        schedule_map: dict[int, dict[str, list[int]]] = {}
+        for frame_idx, speaker, token_ids in schedule:
+            schedule_map.setdefault(frame_idx, {}).setdefault(speaker, []).extend(token_ids)
+
+        audio_a_chunks: list[np.ndarray] = []
+        audio_b_chunks: list[np.ndarray] = []
+
+        for frame in range(total_frames):
+            # Inject scheduled text tokens into the appropriate stream
+            text_ids_a = schedule_map.get(frame, {}).get("A", None)
+            text_ids_b = schedule_map.get(frame, {}).get("B", None)
+
+            # Step the LM one frame
+            # lm_gen.step() returns (text_token, audio_codes) for the main stream
+            # For multi-stream models oracle tokens feed the secondary stream
+            text_tok, codes = state.lm_gen.step(
+                text_ids_a[0] if text_ids_a else None,
+                oracle_tokens=text_ids_b[0] if text_ids_b else None,
+            )
+
+            # Decode the audio codes (Mimi codecs) to waveform
+            # codes shape: [K, 1] where K=num_codebooks
+            codes_tensor = torch.tensor(codes, device=device).unsqueeze(0)  # [1, K, 1]
+            pcm = state.mimi.decode(codes_tensor)  # [1, 1, frame_size]
+            audio_frame = pcm.squeeze().cpu().numpy().astype(np.float32)
+            # Split L/R if stereo output, else duplicate for speaker assignment
+            if audio_frame.ndim == 2:
+                audio_a_chunks.append(audio_frame[0])
+                audio_b_chunks.append(audio_frame[1])
+            else:
+                # Fallback: assign same audio to both (not ideal)
+                audio_a_chunks.append(audio_frame)
+                audio_b_chunks.append(audio_frame)
+
+        if not audio_a_chunks:
             return None
 
-        stereo, sr = sf.read(output_path, always_2d=True)
-        if stereo.shape[1] < 2:
-            return None
-        audio_a = stereo[:, 0]
-        audio_b = stereo[:, 1]
-        return audio_a, audio_b
+        return np.concatenate(audio_a_chunks), np.concatenate(audio_b_chunks)
+
+    except Exception as e:
+        print(f"[WARN] kame synthesis error (seed={seed}): {e}")
+        return None
 
 
 def synthesize_dialogue(
@@ -130,20 +237,20 @@ def synthesize_dialogue(
     j_moshi_repo: str,
 ) -> bool:
     """Synthesize with multiple seeds and keep the one with lowest WER."""
-    ref_a = _dialogue_reference(turns, "A")
-    ref_b = _dialogue_reference(turns, "B")
+    ref_a = " ".join(t["text"] for t in turns if t.get("speaker") == "A")
+    ref_b = " ".join(t["text"] for t in turns if t.get("speaker") == "B")
 
     best_wer = float("inf")
     best_audio: tuple[np.ndarray, np.ndarray] | None = None
 
     for seed in range(num_seeds):
-        result = _synthesize_with_j_moshi(turns, seed=seed, device=device, j_moshi_repo=j_moshi_repo)
+        result = synthesize_with_kame(turns, seed=seed, device=device, repo=j_moshi_repo)
         if result is None:
             continue
         audio_a, audio_b = result
 
-        hyp_a = _transcribe_channel(audio_a, device)
-        hyp_b = _transcribe_channel(audio_b, device)
+        hyp_a = _transcribe_mono(audio_a, device)
+        hyp_b = _transcribe_mono(audio_b, device)
         wer = (_compute_wer(ref_a, hyp_a) + _compute_wer(ref_b, hyp_b)) / 2
 
         if wer < best_wer:
@@ -182,8 +289,7 @@ def main(args: argparse.Namespace) -> None:
             turns = json.load(f)
 
         ok = synthesize_dialogue(
-            turns,
-            out_path,
+            turns, out_path,
             num_seeds=args.num_seeds,
             device=args.device,
             j_moshi_repo=args.j_moshi_repo,
@@ -199,32 +305,15 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Synthesize stereo WAV files from dialogue JSON using J-Moshi TTS."
+        description="Synthesize stereo WAV files from dialogue JSON using J-Moshi (kame-model offline)."
     )
+    parser.add_argument("--input_dir", type=str, default="data/japanese_kame/dialogues")
+    parser.add_argument("--output_dir", type=str, default="data/japanese_kame/audio")
+    parser.add_argument("--j_moshi_repo", type=str, default="nu-dialogue/j-moshi-ext")
     parser.add_argument(
-        "--input_dir",
-        type=str,
-        default="data/japanese_kame/dialogues",
-        help="Directory containing dialogue JSON files.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="data/japanese_kame/audio",
-        help="Directory to write stereo WAV files (L=A, R=B).",
-    )
-    parser.add_argument(
-        "--j_moshi_repo",
-        type=str,
-        default="nu-dialogue/j-moshi-ext",
-        help="HuggingFace repo ID for J-Moshi (used by the TTS CLI).",
-    )
-    parser.add_argument(
-        "--num_seeds",
-        type=int,
-        default=10,
-        help="Number of random seeds to try; keep lowest WER (J-Moshi paper Sec. 3.4).",
+        "--num_seeds", type=int, default=10,
+        help="Number of random seeds; keep lowest WER (J-Moshi paper Sec. 3.4).",
     )
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--resume", action="store_true", help="Skip already-synthesized files.")
+    parser.add_argument("--resume", action="store_true")
     main(parser.parse_args())

@@ -12,8 +12,10 @@ The front-end S2S model and audio loop are **unchanged** from kame.server_oracle
 
 Usage:
     # Start vLLM server first:
+    # NOTE: vLLM 0.19.x does NOT have a built-in "llmjp4" reasoning parser.
+    # Omit --reasoning-parser; parse_harmony_response() handles Harmony tags
+    # on the client side (this server) instead.
     vllm serve llm-jp/llm-jp-4-8b-thinking \
-        --reasoning-parser llmjp4 \
         --max-model-len 8192 \
         --port 8000
 
