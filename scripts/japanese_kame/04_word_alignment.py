@@ -1,16 +1,20 @@
-"""Generate word-level timestamps for stereo WAV files using faster-whisper.
+"""Generate word-level timestamps for stereo WAV files using forced alignment.
 
-Reads stereo WAVs (L=speaker A, R=speaker B), processes each channel
-independently, and writes canonical text/*.json files:
+Reads stereo WAVs (L=speaker A, R=speaker B) together with the corresponding
+dialogue JSON (same stem, from --dialogue_dir) that contains the ground-truth
+text.  Performs CTC forced alignment via stable-ts so that the output words
+exactly match the source text — no ASR transcription errors.
+
+Output per file (--output_dir/<stem>.json):
 
     [{"speaker": "A", "word": "こんにちは", "start": 0.46, "end": 1.02}, ...]
 
 Usage:
     uv run --extra data -m scripts.japanese_kame.04_word_alignment \
-        --audio_dir  data/japanese_kame/test_audio \
-        --output_dir data/japanese_kame/test_text \
-        --device cuda \
-        --num_workers 4
+        --audio_dir    data/japanese_kame/test_audio \
+        --dialogue_dir data/japanese_kame/test_dialogues \
+        --output_dir   data/japanese_kame/test_text \
+        --device cuda
 """
 
 from __future__ import annotations
@@ -18,7 +22,6 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
-import os
 from pathlib import Path
 
 import numpy as np
@@ -36,17 +39,14 @@ def _resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     if orig_sr == target_sr:
         return audio
     try:
-        import torchaudio
-
         import torch
+        import torchaudio
 
         wav = torch.from_numpy(audio).unsqueeze(0)
         resampler = torchaudio.transforms.Resample(orig_sr, target_sr)
         return resampler(wav).squeeze(0).numpy()
     except Exception:
-        # fallback: linear interpolation
-        factor = target_sr / orig_sr
-        new_len = int(len(audio) * factor)
+        new_len = int(len(audio) * target_sr / orig_sr)
         return np.interp(
             np.linspace(0, len(audio) - 1, new_len),
             np.arange(len(audio)),
@@ -54,28 +54,36 @@ def _resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
         ).astype(audio.dtype)
 
 
-def align_audio(
-    audio_mono: np.ndarray,
-    orig_sr: int,
-    speaker: str,
-    device: str,
-    compute_type: str = "float16",
-) -> list[dict]:
-    """Run faster-whisper on a mono audio array and return word-level transcript."""
-    from faster_whisper import WhisperModel
-
+def _get_model(device: str, compute_type: str):
     cache_key = f"{WHISPER_MODEL}:{device}:{compute_type}"
     if cache_key not in _model_cache:
-        _model_cache[cache_key] = WhisperModel(
+        import stable_whisper
+
+        _model_cache[cache_key] = stable_whisper.load_faster_whisper(
             WHISPER_MODEL, device=device, compute_type=compute_type
         )
-    model = _model_cache[cache_key]
+    return _model_cache[cache_key]
 
+
+def forced_align(
+    audio_mono: np.ndarray,
+    orig_sr: int,
+    text: str,
+    speaker: str,
+    device: str,
+    compute_type: str,
+) -> list[dict]:
+    """Align known text to mono audio using CTC forced alignment.
+
+    Returns word-level dicts with exact words from `text` (no ASR errors).
+    """
+    model = _get_model(device, compute_type)
     audio_16k = _resample(audio_mono, orig_sr, SAMPLE_RATE).astype(np.float32)
-    segments, _ = model.transcribe(audio_16k, language="ja", word_timestamps=True, beam_size=5)
+
+    result = model.align(audio_16k, text, language="ja")
 
     words = []
-    for seg in segments:
+    for seg in result.segments:
         for w in seg.words or []:
             word = w.word.strip()
             if word and w.start is not None and w.end is not None:
@@ -90,8 +98,24 @@ def align_audio(
     return words
 
 
-def process_file(audio_path: Path, output_dir: Path, device: str, compute_type: str) -> bool:
-    out_path = output_dir / f"{audio_path.stem}.json"
+def process_file(
+    audio_path: Path,
+    dialogue_dir: Path,
+    output_dir: Path,
+    device: str,
+    compute_type: str,
+) -> bool:
+    dialogue_path = dialogue_dir / f"{audio_path.stem}.json"
+    if not dialogue_path.exists():
+        print(f"[WARN] No dialogue JSON for {audio_path.name}, skipping")
+        return False
+
+    with dialogue_path.open(encoding="utf-8") as f:
+        turns = json.load(f)
+
+    text_a = " ".join(t["text"] for t in turns if t.get("speaker") == "A")
+    text_b = " ".join(t["text"] for t in turns if t.get("speaker") == "B")
+
     try:
         stereo, sr = sf.read(str(audio_path), always_2d=True)
     except Exception as e:
@@ -102,33 +126,37 @@ def process_file(audio_path: Path, output_dir: Path, device: str, compute_type: 
         print(f"[WARN] {audio_path.name} is not stereo, skipping")
         return False
 
-    audio_a = stereo[:, 0]
-    audio_b = stereo[:, 1]
-
-    words_a = align_audio(audio_a, sr, "A", device, compute_type)
-    words_b = align_audio(audio_b, sr, "B", device, compute_type)
+    words_a = forced_align(stereo[:, 0], sr, text_a, "A", device, compute_type) if text_a else []
+    words_b = forced_align(stereo[:, 1], sr, text_b, "B", device, compute_type) if text_b else []
 
     all_words = sorted(words_a + words_b, key=lambda w: w["start"])
 
+    out_path = output_dir / f"{audio_path.stem}.json"
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(all_words, f, ensure_ascii=False, indent=2)
     return True
 
 
 def worker(
-    audio_paths: list[Path], output_dir: Path, device: str, resume: bool, compute_type: str
+    audio_paths: list[Path],
+    dialogue_dir: Path,
+    output_dir: Path,
+    device: str,
+    resume: bool,
+    compute_type: str,
 ) -> None:
     for audio_path in tqdm(audio_paths, desc=f"[{device}]", dynamic_ncols=True):
         out_path = output_dir / f"{audio_path.stem}.json"
         if resume and out_path.exists():
             continue
-        ok = process_file(audio_path, output_dir, device, compute_type)
+        ok = process_file(audio_path, dialogue_dir, output_dir, device, compute_type)
         if not ok:
             print(f"[WARN] Skipped: {audio_path.name}")
 
 
 def main(args: argparse.Namespace) -> None:
     audio_dir = Path(args.audio_dir)
+    dialogue_dir = Path(args.dialogue_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -140,14 +168,15 @@ def main(args: argparse.Namespace) -> None:
     compute_type = args.compute_type or ("float16" if args.device != "cpu" else "int8")
 
     if args.num_workers <= 1:
-        worker(audio_files, output_dir, args.device, args.resume, compute_type)
+        worker(audio_files, dialogue_dir, output_dir, args.device, args.resume, compute_type)
     else:
         chunks = np.array_split(audio_files, args.num_workers)
         processes = []
         for i, chunk in enumerate(chunks):
             device = f"cuda:{i}" if args.device == "cuda" else args.device
             p = mp.Process(
-                target=worker, args=(list(chunk), output_dir, device, args.resume, compute_type)
+                target=worker,
+                args=(list(chunk), dialogue_dir, output_dir, device, args.resume, compute_type),
             )
             p.start()
             processes.append(p)
@@ -162,20 +191,11 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generate word-level timestamps from stereo WAV files using WhisperX."
+        description="Forced-align stereo WAV files to their ground-truth dialogue text."
     )
-    parser.add_argument(
-        "--audio_dir",
-        type=str,
-        default="data/japanese_kame/test_audio",
-        help="Directory containing stereo WAV files.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="data/japanese_kame/test_text",
-        help="Directory to write canonical text/*.json files.",
-    )
+    parser.add_argument("--audio_dir", type=str, default="data/japanese_kame/test_audio")
+    parser.add_argument("--dialogue_dir", type=str, default="data/japanese_kame/test_dialogues")
+    parser.add_argument("--output_dir", type=str, default="data/japanese_kame/test_text")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument(
         "--compute_type",
