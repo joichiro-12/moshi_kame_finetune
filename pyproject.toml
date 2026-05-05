@@ -32,6 +32,7 @@ oracle = [
 data = [
     "datasets>=2.14.0",
     "faster-whisper>=1.0.0",
+    "stable-ts>=2.17.0",
 ]
 server-jp = [
     "google-cloud-speech>=2.0.0",
