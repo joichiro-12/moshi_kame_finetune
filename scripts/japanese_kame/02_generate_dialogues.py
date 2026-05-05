@@ -9,8 +9,11 @@ Speaker A is the questioner; speaker B is the answerer.
 Usage:
     export OPENAI_API_KEY=...
     uv run --extra oracle -m scripts.japanese_kame.02_generate_dialogues \
-        --model gpt-5.4-mini \
-        --max_workers 16
+        --model    llm-jp/llm-jp-4-8b-thinking \
+        --llm_base_url http://localhost:8000/v1 \
+        --no_strict_format \
+        --max_workers 2 \
+        --resume
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -38,7 +42,15 @@ USER_PROMPT_TEMPLATE = """以下のQ&Aペアを2人の話者による自然な�
 質問: {question}
 回答: {answer}"""
 
-_RESPONSE_FORMAT = {
+USER_PROMPT_TEMPLATE_JSON = """以下のQ&Aペアを2人の話者による自然な日本語会話に変換してください。
+
+質問: {question}
+回答: {answer}
+
+必ず以下のJSON形式で出力してください（他のテキストは不要）:
+{{"turns": [{{"speaker": "A", "text": "発話内容"}}, {{"speaker": "B", "text": "発話内容"}}]}}"""
+
+_RESPONSE_FORMAT_STRICT = {
     "type": "json_schema",
     "json_schema": {
         "name": "dialogue",
@@ -65,31 +77,65 @@ _RESPONSE_FORMAT = {
     },
 }
 
+_RESPONSE_FORMAT_JSON = {"type": "json_object"}
+
 _print_lock = threading.Lock()
+
+
+def _extract_json(text: str) -> str:
+    """Extract the JSON object containing 'turns' from model output.
+
+    Handles models that prepend free-form thinking text to the JSON answer,
+    with or without <think>...</think> tags.
+    """
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    # Find the JSON object that contains "turns" using brace-depth tracking
+    m = re.search(r'\{[^{]*"turns"', text, re.DOTALL)
+    if m:
+        start = m.start()
+        depth = 0
+        for i, c in enumerate(text[start:], start):
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+    # Fallback: find any JSON-like object
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    return m.group(0) if m else text
 
 
 def generate_dialogue(
     qa: dict,
     client,
     model: str,
+    use_strict_format: bool = True,
 ) -> list[dict[str, str]]:
-    prompt = USER_PROMPT_TEMPLATE.format(
+    template = USER_PROMPT_TEMPLATE if use_strict_format else USER_PROMPT_TEMPLATE_JSON
+    prompt = template.format(
         question=qa["question"],
         answer=qa["answer"],
     )
+    if use_strict_format:
+        kwargs: dict = {"response_format": _RESPONSE_FORMAT_STRICT}
+    else:
+        # json_object guided decoding on this model produces garbled output;
+        # omit response_format and extract JSON from free-text response instead.
+        kwargs = {"extra_body": {"reasoning_effort": "low"}}
     response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        response_format=_RESPONSE_FORMAT,
         stream=False,
+        **kwargs,
     )
     raw = (response.choices[0].message.content or "").strip()
     if not raw:
         return []
-    return json.loads(raw)["turns"]
+    return json.loads(_extract_json(raw))["turns"]
 
 
 def process_file(
@@ -98,6 +144,7 @@ def process_file(
     client,
     model: str,
     resume: bool,
+    use_strict_format: bool = True,
 ) -> tuple[int, int]:
     success = 0
     fail = 0
@@ -110,27 +157,31 @@ def process_file(
         if resume and out_path.exists():
             success += 1
             continue
-        try:
-            turns = generate_dialogue(qa, client, model)
-            if not turns:
-                fail += 1
-                continue
-            with out_path.open("w", encoding="utf-8") as f:
-                json.dump(turns, f, ensure_ascii=False, indent=2)
-            success += 1
-        except Exception as e:
-            with _print_lock:
-                print(f"[WARN] {out_id}: {e}")
-            fail += 1
+        for attempt in range(3):
+            try:
+                turns = generate_dialogue(qa, client, model, use_strict_format=use_strict_format)
+                if not turns:
+                    raise ValueError("empty turns")
+                with out_path.open("w", encoding="utf-8") as f:
+                    json.dump(turns, f, ensure_ascii=False, indent=2)
+                success += 1
+                break
+            except Exception as e:
+                if attempt < 2:
+                    with _print_lock:
+                        print(f"[RETRY {attempt + 1}/3] {out_id}: {e}")
+                else:
+                    with _print_lock:
+                        print(f"[WARN] {out_id}: {e}")
+                    fail += 1
     return success, fail
 
 
 def main(args: argparse.Namespace) -> None:
     from openai import OpenAI
 
-    api_key = args.api_key or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY environment variable is not set")
+    api_key = args.api_key or os.getenv("OPENAI_API_KEY") or "dummy"
+    use_strict_format = not args.no_strict_format
 
     client = OpenAI(
         api_key=api_key,
@@ -151,7 +202,7 @@ def main(args: argparse.Namespace) -> None:
 
     with ThreadPoolExecutor(max_workers=args.max_workers) as pool:
         futures = {
-            pool.submit(process_file, p, output_dir, client, args.model, args.resume): p
+            pool.submit(process_file, p, output_dir, client, args.model, args.resume, use_strict_format): p
             for p in jsonl_files
         }
         for future in as_completed(futures):
@@ -177,20 +228,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--input_dir",
         type=str,
-        default="data/japanese_kame/qa_test",
+        default="data/japanese_kame/qa_pairs",
         help="Directory containing JSONL QA pair files.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="data/japanese_kame/test_dialogues",
+        default="data/japanese_kame/dialogues",
         help="Directory to write dialogue JSON files.",
     )
     parser.add_argument("--model", type=str, default="gpt-4.1-mini")
     parser.add_argument(
         "--max_workers",
         type=int,
-        default=16,
+        default=2,
         help="Number of parallel LLM API threads.",
     )
     parser.add_argument("--resume", action="store_true", help="Skip already-generated files.")
@@ -200,5 +251,10 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="Custom LLM base URL (e.g. vLLM endpoint).",
+    )
+    parser.add_argument(
+        "--no_strict_format",
+        action="store_true",
+        help="Use json_object instead of json_schema (needed for vLLM / local models).",
     )
     main(parser.parse_args())
