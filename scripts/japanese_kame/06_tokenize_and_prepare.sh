@@ -11,15 +11,15 @@
 #   NUM_WORKERS
 set -euo pipefail
 
-AUDIO_DIR="${AUDIO_DIR:-data/japanese_kame/audio}"
-TEXT_DIR="${TEXT_DIR:-data/japanese_kame/text}"
-ORACLE_DIR="${ORACLE_DIR:-data/japanese_kame/oracle_raw}"
+AUDIO_DIR="${AUDIO_DIR:-data/japanese_kame/test_audio}"
+TEXT_DIR="${TEXT_DIR:-data/japanese_kame/test_text}"
+ORACLE_DIR="${ORACLE_DIR:-data/japanese_kame/test_oracle_raw}"
 
-TOKENIZED_AUDIO_DIR="${TOKENIZED_AUDIO_DIR:-data/japanese_kame/tokenized_audio}"
-TOKENIZED_TEXT_DIR="${TOKENIZED_TEXT_DIR:-data/japanese_kame/tokenized_text}"
-TOKENIZED_ORACLE_DIR="${TOKENIZED_ORACLE_DIR:-data/japanese_kame/tokenized_oracle_a0b1_events}"
+TOKENIZED_AUDIO_DIR="${TOKENIZED_AUDIO_DIR:-data/japanese_kame/test_tokenized_audio}"
+TOKENIZED_TEXT_DIR="${TOKENIZED_TEXT_DIR:-data/japanese_kame/test_tokenized_text}"
+TOKENIZED_ORACLE_DIR="${TOKENIZED_ORACLE_DIR:-data/japanese_kame/test_tokenized_oracle_a0b1_events}"
 
-OUTPUT_PREFIX="${OUTPUT_PREFIX:-processed_data/japanese_kame/train_text_oracle_a0b1_events}"
+OUTPUT_PREFIX="${OUTPUT_PREFIX:-processed_data/japanese_kame/test_text_oracle_a0b1_events}"
 
 # J-Moshi uses rinna/japanese-gpt2-medium SentencePiece.
 # Confirm the exact filename by checking nu-dialogue/j-moshi-ext on HuggingFace.

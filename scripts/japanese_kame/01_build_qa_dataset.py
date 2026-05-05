@@ -19,32 +19,33 @@ from pathlib import Path
 
 
 def _load_jmmlu(output_dir: Path) -> int:
-    from datasets import load_dataset
+    from datasets import get_dataset_config_names, load_dataset
 
-    choices_keys = ["A", "B", "C", "D"]
     out_path = output_dir / "jmmlu.jsonl"
     count = 0
+    try:
+        subjects = get_dataset_config_names("nlp-waseda/JMMLU")
+    except Exception as e:
+        print(f"[JMMLU] Failed to get config names: {e}")
+        print(f"[JMMLU] 0 records -> {out_path}")
+        out_path.write_text("")
+        return 0
+
     with out_path.open("w", encoding="utf-8") as f:
-        for split in ("test", "validation"):
+        for subject in subjects:
             try:
-                ds = load_dataset("answerdotai/JMMLU", split=split, trust_remote_code=True)
+                ds = load_dataset("nlp-waseda/JMMLU", subject, split="test", trust_remote_code=True)
             except Exception as e:
-                print(f"[JMMLU] Skipping split {split}: {e}")
+                print(f"[JMMLU] Skipping subject {subject}: {e}")
                 continue
             for row in ds:
-                question = row["question"]
                 answer_key = row["answer"]
-                choices = row.get("choices", [row.get(k, "") for k in choices_keys])
-                if isinstance(choices, list) and len(choices) >= 1:
-                    answer_idx = choices_keys.index(answer_key) if answer_key in choices_keys else 0
-                    answer_text = choices[answer_idx] if answer_idx < len(choices) else answer_key
-                else:
-                    answer_text = str(answer_key)
+                answer_text = row.get(answer_key, answer_key)
                 record = {
-                    "question": question,
+                    "question": row["question"],
                     "answer": answer_text,
                     "source": "JMMLU",
-                    "category": row.get("subject", ""),
+                    "category": subject,
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 count += 1
@@ -84,25 +85,16 @@ def _load_jcommonsenseqa(output_dir: Path) -> int:
     with out_path.open("w", encoding="utf-8") as f:
         for split in ("train", "validation"):
             try:
-                ds = load_dataset(
-                    "llm-jp/jcommonsenseqa-v1.1", split=split, trust_remote_code=True
-                )
-            except Exception:
-                try:
-                    ds = load_dataset(
-                        "Aratako/jcommonsenseqa-v1.1", split=split, trust_remote_code=True
-                    )
-                except Exception as e:
-                    print(f"[JCommonsenseQA] Skipping split {split}: {e}")
-                    continue
+                ds = load_dataset("sbintuitions/JCommonsenseQA", split=split)
+            except Exception as e:
+                print(f"[JCommonsenseQA] Skipping split {split}: {e}")
+                continue
             for row in ds:
-                question = row["question"]
-                label = row.get("label", 0)
-                choices = [row.get(f"choice{i}", "") for i in range(5)]
-                answer = choices[int(label)] if int(label) < len(choices) else str(label)
+                label = int(row["label"])
+                choices = [row[f"choice{i}"] for i in range(5)]
                 record = {
-                    "question": question,
-                    "answer": answer,
+                    "question": row["question"],
+                    "answer": choices[label] if label < len(choices) else str(label),
                     "source": "JCommonsenseQA",
                     "category": "commonsense",
                 }
@@ -145,42 +137,12 @@ def _load_jaquad(output_dir: Path) -> int:
     return count
 
 
-def _load_aio(output_dir: Path) -> int:
-    from datasets import load_dataset
-
-    out_path = output_dir / "aio.jsonl"
-    count = 0
-    with out_path.open("w", encoding="utf-8") as f:
-        for split in ("train", "validation"):
-            try:
-                ds = load_dataset("hpprc/aio", split=split, trust_remote_code=True)
-            except Exception as e:
-                print(f"[AIO] Skipping split {split}: {e}")
-                continue
-            for row in ds:
-                question = row.get("question", "")
-                answers = row.get("answers", [])
-                answer = answers[0] if answers else ""
-                if not question or not answer:
-                    continue
-                record = {
-                    "question": question,
-                    "answer": answer,
-                    "source": "AIO",
-                    "category": "open_domain_qa",
-                }
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                count += 1
-    print(f"[AIO] {count} records -> {out_path}")
-    return count
-
 
 LOADERS = {
     "jmmlu": _load_jmmlu,
     "mgsm_ja": _load_mgsm_ja,
     "jcommonsenseqa": _load_jcommonsenseqa,
     "jaquad": _load_jaquad,
-    "aio": _load_aio,
 }
 
 

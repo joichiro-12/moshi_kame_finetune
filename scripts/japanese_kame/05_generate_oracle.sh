@@ -3,8 +3,8 @@
 # Uses gpt-4.1-mini with Japanese prompts (--language ja).
 set -euo pipefail
 
-TEXT_DIR="${TEXT_DIR:-data/japanese_kame/text}"
-OUTPUT_DIR="${OUTPUT_DIR:-data/japanese_kame/oracle_raw}"
+TEXT_DIR="${TEXT_DIR:-data/japanese_kame/test_text}"
+OUTPUT_DIR="${OUTPUT_DIR:-data/japanese_kame/test_oracle_raw}"
 MODEL="${MODEL:-gpt-4.1-mini}"
 TIME_INTERVAL="${TIME_INTERVAL:-0.5}"
 LLM_BASE_URL="${LLM_BASE_URL:-}"
