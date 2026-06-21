@@ -11,10 +11,10 @@ Output per file (--output_dir/<stem>.json):
 
 Usage:
     uv run --extra data -m scripts.japanese_kame.04_word_alignment \
-        --audio_dir    data/japanese_kame/test_audio \
-        --dialogue_dir data/japanese_kame/test_dialogues \
-        --output_dir   data/japanese_kame/test_text \
-        --device cuda
+        --audio_dir    data/japanese_kame/audio_gemini \
+        --dialogue_dir data/japanese_kame/dialogues \
+        --output_dir   data/japanese_kame/0610/text \
+        --device cuda:1
 """
 
 from __future__ import annotations
@@ -59,9 +59,16 @@ def _get_model(device: str, compute_type: str):
     if cache_key not in _model_cache:
         import stable_whisper
 
-        _model_cache[cache_key] = stable_whisper.load_faster_whisper(
-            WHISPER_MODEL, device=device, compute_type=compute_type
-        )
+        # ctranslate2 requires device="cuda" + device_index=N; "cuda:N" is unsupported
+        if ":" in device:
+            dev, idx = device.split(":", 1)
+            _model_cache[cache_key] = stable_whisper.load_faster_whisper(
+                WHISPER_MODEL, device=dev, device_index=int(idx), compute_type=compute_type
+            )
+        else:
+            _model_cache[cache_key] = stable_whisper.load_faster_whisper(
+                WHISPER_MODEL, device=device, compute_type=compute_type
+            )
     return _model_cache[cache_key]
 
 

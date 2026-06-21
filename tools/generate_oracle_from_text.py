@@ -14,6 +14,7 @@ from tools.oracle_generation import (
 )
 
 DEFAULT_MODEL_NAME = "gpt-4.1-nano"
+DEFAULT_LLM_BASE_URL = "http://localhost:8000/v1"
 
 SYSTEM_PROMPT_EN = (
     "You are a helpful assistant that predicts the next response in a spoken conversation."
@@ -173,6 +174,33 @@ Respond with only the predicted text that {request.next_speaker} will say."""
     return prompt
 
 
+def get_vllm_model_name(base_url: str) -> str:
+    """vLLM サーバーから最初の利用可能なモデル名を取得する。"""
+    import urllib.request
+
+    models_url = base_url.rstrip("/").removesuffix("/v1") + "/v1/models"
+    with urllib.request.urlopen(models_url, timeout=5) as resp:
+        data = json.loads(resp.read())
+    models = data.get("data", [])
+    if not models:
+        raise RuntimeError(f"No models found at {models_url}")
+    return models[0]["id"]
+
+
+def strip_reasoning(content: str) -> str:
+    """Thinking モデル（例: llm-jp-*-thinking）の reasoning 部分を除去する。
+
+    これらのモデルは ` analysis <推論過程> assistant final <最終回答>` という
+    形式で content を返す。reasoning parser なしで vLLM を起動している場合、
+    content にこの全文が含まれるため、最終回答だけを取り出す。
+    マーカーが無い場合（GPT など非 thinking モデル）はそのまま返す。
+    """
+    marker = "assistant final"
+    if marker in content:
+        return content.rsplit(marker, 1)[1].strip()
+    return content.strip()
+
+
 def make_openai_predict_fn(
     *,
     model_name: str,
@@ -210,7 +238,7 @@ def make_openai_predict_fn(
                 return fallback_prediction_for_request(request)
             raise
 
-        return (response.choices[0].message.content or "").strip()
+        return strip_reasoning(response.choices[0].message.content or "")
 
     return predict
 
@@ -262,10 +290,17 @@ def process_text_file(
 
 def main(args: argparse.Namespace) -> None:
     speaker_to_channel = {"A": args.A_channel, "B": args.B_channel}
+
+    base_url = args.llm_base_url or None
+    model_name = args.model
+    if base_url and model_name == DEFAULT_MODEL_NAME:
+        model_name = get_vllm_model_name(base_url)
+        print(f"Auto-detected vLLM model: {model_name}")
+
     predict_fn = make_openai_predict_fn(
-        model_name=args.model,
+        model_name=model_name,
         fallback_to_hint_on_error=args.fallback_to_hint_on_error,
-        base_url=args.llm_base_url or None,
+        base_url=base_url,
         api_key=args.llm_api_key or None,
         language=args.language,
     )
@@ -273,6 +308,13 @@ def main(args: argparse.Namespace) -> None:
     text_paths = sorted(Path(args.text_dir).glob("*.json"))
     if args.limit is not None:
         text_paths = text_paths[: args.limit]
+
+    # Shard the file list so multiple processes can run concurrently against the
+    # same vLLM server. Shards are disjoint (stride slicing), so workers never
+    # touch the same output file.
+    if args.num_shards > 1:
+        text_paths = text_paths[args.shard_id :: args.num_shards]
+        print(f"Shard {args.shard_id}/{args.num_shards}: {len(text_paths)} files")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -307,6 +349,18 @@ if __name__ == "__main__":
     parser.add_argument("--B_channel", type=int, default=1)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="Total number of parallel shards. Run one process per shard_id.",
+    )
+    parser.add_argument(
+        "--shard_id",
+        type=int,
+        default=0,
+        help="This process's shard index in [0, num_shards).",
+    )
     parser.add_argument("--fallback_to_hint_on_error", action="store_true")
     parser.add_argument(
         "--language",
@@ -318,7 +372,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--llm_base_url",
         type=str,
-        default="",
+        default=DEFAULT_LLM_BASE_URL,
         help=(
             "Custom LLM base URL (e.g. http://localhost:8000/v1 for vLLM). "
             "Leave empty to use the standard OpenAI endpoint."
@@ -327,7 +381,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--llm_api_key",
         type=str,
-        default="",
+        default="EMPTY",
         help=(
             "API key for the LLM endpoint. Falls back to OPENAI_API_KEY env var. "
             "Set to 'EMPTY' for local vLLM servers that require a placeholder key."

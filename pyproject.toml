@@ -38,8 +38,8 @@ server-jp = [
     "google-cloud-speech>=2.0.0",
 ]
 tts = [
-    "google-genai>=1.0.0",
-    "google-auth>=2.0.0",
+    # qwen-tts は accelerate バージョン競合のため別 venv で管理する
+    # python -m venv .venv-tts && .venv-tts/bin/pip install qwen-tts soundfile tqdm numpy torch
 ]
 
 [[tool.uv.index]]
