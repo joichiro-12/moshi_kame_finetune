@@ -66,6 +66,10 @@ JA_SYSTEM_PROMPT = """あなたは Moshi の日本語版です。ユーザーと
 
 JA_ASR_DEFAULT_LANGUAGE = "ja-JP"
 
+# Set ORACLE_DEBUG=1 to also log the full oracle prompt and the raw LLM
+# response (including the analysis/thinking channel) — verbose.
+_ORACLE_DEBUG = os.getenv("ORACLE_DEBUG", "0").lower() not in ("0", "", "false")
+
 # Regex to extract the `final` channel from LLM-jp-4 Harmony output.
 # Format: <|channel|>analysis<|message|>[CoT]<|channel|>final<|message|>[answer]<|return|>
 _HARMONY_FINAL_RE = re.compile(
@@ -80,9 +84,19 @@ def parse_harmony_response(raw: str) -> str:
     Falls back to returning the raw string if no Harmony markup is found
     (handles llm-jp-4-instruct which does not use the thinking format).
     """
+    # 1) Harmony tag form: <|channel|>final<|message|>...<|return|>
     m = _HARMONY_FINAL_RE.search(raw)
     if m:
         return m.group(1).strip()
+    # 2) Plain-text "analysis ... assistant final ..." form emitted by
+    #    llm-jp-4-8b-thinking (no Harmony tags). Keep only the final answer.
+    if "assistant final" in raw:
+        return raw.rsplit("assistant final", 1)[1].strip()
+    # 3) Reasoning has started but the final answer is not out yet — suppress so
+    #    the analysis/chain-of-thought never reaches the oracle stream.
+    if raw.lstrip().lower().startswith("analysis"):
+        return ""
+    # 4) Plain instruct model with no reasoning markers → use as-is.
     return raw.strip()
 
 
@@ -157,11 +171,24 @@ class JaLLMStreamManager(_upstream.LLMStreamManager):
         stream_start_ms = int(time.time() * 1000)
         stream_tokens: list[str] = []
         accumulated = ""
+        emitted = ""  # full final-answer text already forwarded to the oracle
+
+        # Log the oracle INPUT: what the oracle LLM sees — the pending user
+        # utterance (from ASR) plus the tail of the committed conversation.
+        # If [oracle:in] never appears, no ASR text is reaching the oracle
+        # (check for [ASR Partial ...] lines → mic/ASR problem).
+        log(
+            "info",
+            f"[oracle:in] pending={pending_user_text.strip()!r} "
+            f"context_tail={committed_conversation.strip()[-200:]!r}",
+        )
 
         try:
             messages: list[dict[str, Any]] = self._build_messages(
                 committed_conversation, pending_user_text
             )
+            if _ORACLE_DEBUG:
+                log("info", f"[oracle:prompt] {messages[-1]['content']!r}")
             stream = await self.client.chat.completions.create(
                 model=self.llm_model,
                 messages=messages,  # type: ignore[arg-type]
@@ -190,10 +217,18 @@ class JaLLMStreamManager(_upstream.LLMStreamManager):
                 if not stripped:
                     continue
 
-                # Find new text since the last enqueue
-                new_text = stripped[len("".join(stream_tokens)):]
+                # Emit only the delta vs what was already forwarded. Track the
+                # full previous final text (with spaces) so tokens aren't
+                # duplicated by a no-space length mismatch.
+                if stripped.startswith(emitted):
+                    new_text = stripped[len(emitted):]
+                else:
+                    # Final text changed/reset (re-parse) — resend from scratch.
+                    new_text = stripped
+                    first_oracle_chunk = True
                 if not new_text.strip():
                     continue
+                emitted = stripped
 
                 if first_oracle_chunk:
                     try:
@@ -210,6 +245,12 @@ class JaLLMStreamManager(_upstream.LLMStreamManager):
                     self.server_state.oracle_queue.put_nowait(("append", word))
                 except asyncio.QueueFull:
                     log("warning", "Oracle queue full; dropping LLM-jp4 chunk.")
+
+            # Log the oracle OUTPUT (the text actually fed into the model's
+            # oracle stream this round).
+            log("info", f"[oracle:out] {' '.join(stream_tokens)!r}")
+            if _ORACLE_DEBUG:
+                log("info", f"[oracle:raw] {accumulated!r}")
 
             if stream_tokens:
                 _upstream._append_session_log(

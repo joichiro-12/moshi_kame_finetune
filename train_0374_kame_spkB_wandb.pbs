@@ -1,0 +1,86 @@
+#!/bin/bash
+# =====================================================================
+# J-KAME finetune on ABCI 3.0 (LLM-jp) — SPEAKER B (answerer), same as
+# train_0374_kame_spkB.pbs but with Weights & Biases logging ENABLED.
+#
+# What is different from train_0374_kame_spkB.pbs:
+#   - REPORT_TO=wandb   -> finetune.py initializes W&B and logs loss/metrics
+#                          (see finetune.py: --report_to / accelerator.log).
+#   - New OUTPUT_DIR     -> does NOT overwrite the existing
+#                          output/0374_kame-0610-e5-spkB checkpoint.
+#   - WANDB_MODE=offline -> ABCI compute nodes have no internet, so W&B
+#                          writes a local run dir; sync it afterwards from a
+#                          machine with internet (see "AFTER THE RUN" below).
+#
+# Everything else (data, model, hyperparameters, speaker=B) mirrors the
+# original spkB run so the loss curve is comparable.
+#
+# Submit from the experiment repo dir on a login node:
+#   cd /groups/gcg51557/experiments/0374_japanese_kame/moshi_kame_finetune
+#   qsub train_0374_kame_spkB_wandb.pbs
+#
+# Smoke first (1 epoch on a single 200-row parquet, a few minutes):
+#   qsub -v RTYPE=rt_HF,NUM_EPOCHS=1,\
+# TRAIN_DATA_GLOB=processed_data/japanese_kame/0610/batch_0000-001-of-001.parquet,\
+# OUTPUT_DIR=output/0374_kame-spkB-wandb-smoke train_0374_kame_spkB_wandb.pbs
+#
+# AFTER THE RUN (sync the offline W&B run from a node/host with internet):
+#   wandb login                       # once, needs your W&B API key
+#   wandb sync wandb/offline-run-*    # uploads the run(s) captured below
+# =====================================================================
+#PBS -P gcg51557
+#PBS -q R9920261000
+#PBS -v RTYPE=rt_HF
+#PBS -l select=1
+#PBS -l walltime=04:00:00
+#PBS -N 0374_kame_spkB_wandb
+#PBS -j oe
+
+set -euo pipefail
+
+# PBS starts the job in $HOME; move to the dir we submitted from (the repo).
+cd "${PBS_O_WORKDIR:-$(pwd)}"
+
+# --- compute-node environment (see the "ABCI training workflow" memo) ---
+source /etc/profile.d/modules.sh 2>/dev/null || true
+module load cuda/12.1                  # CUDA_HOME for DeepSpeed's nvcc (cu121)
+export PATH="$HOME/.local/bin:$PATH"   # uv is not on PATH on compute nodes
+
+# --- W&B: offline logging (no internet on compute nodes); sync later ---
+export WANDB_MODE=offline
+export WANDB_DIR="${WANDB_DIR:-$PWD}"  # writes ./wandb/offline-run-* here
+
+# --- sanity: confirm we are on a GPU compute node (hnodeXXX), not a login node ---
+echo "host: $(hostname)"
+nvidia-smi -L || { echo "NO GPU visible — are you on a login node?"; exit 1; }
+
+# --- training config (mirrors the spkB run; adds W&B + a fresh output dir) ---
+export MOSHI_SPEAKERS="${MOSHI_SPEAKERS:-B}"
+export REPORT_TO="${REPORT_TO:-wandb}"
+export PROJECT_NAME="${PROJECT_NAME:-0374_japanese_kame}"
+export TRAIN_DATA_GLOB="${TRAIN_DATA_GLOB:-processed_data/japanese_kame/0610/batch_*.parquet}"
+export MODEL_DIR="${MODEL_DIR:-init_models/j-moshi-ext-four_streams-bfloat16}"
+export OUTPUT_DIR="${OUTPUT_DIR:-output/0374_kame-0610-e5-spkB-wandb}"
+export DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-ds_configs/zero3-bfp16-warmlr-act_ckpt.json}"
+export NUM_PROCESSES="${NUM_PROCESSES:-8}"
+export NUM_EPOCHS="${NUM_EPOCHS:-5}"
+export PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
+export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+export NUM_WARMUP_STEPS="${NUM_WARMUP_STEPS:-100}"
+export LOGGING_STEPS="${LOGGING_STEPS:-10}"
+export SAVE_STEPS="${SAVE_STEPS:-500}"
+export USE_ORACLE="${USE_ORACLE:-1}"
+
+mkdir -p "${OUTPUT_DIR}"
+
+echo "=== J-KAME finetune | main speaker = ${MOSHI_SPEAKERS} | report_to = ${REPORT_TO} ==="
+echo "data    : ${TRAIN_DATA_GLOB}"
+echo "init    : ${MODEL_DIR}"
+echo "output  : ${OUTPUT_DIR}"
+echo "wandb   : mode=${WANDB_MODE} project=${PROJECT_NAME} run=$(basename "${OUTPUT_DIR}") dir=${WANDB_DIR}/wandb"
+echo "epochs  : ${NUM_EPOCHS} | per_device_bs=${PER_DEVICE_BATCH_SIZE} x ${NUM_PROCESSES} gpu | use_oracle=${USE_ORACLE}"
+
+bash examples/finetune_j_moshi.sh
+
+echo "=== done. To upload metrics from a host with internet: ==="
+echo "    wandb login && wandb sync ${WANDB_DIR}/wandb/offline-run-*"

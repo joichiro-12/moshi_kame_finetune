@@ -18,6 +18,13 @@
 #   LOGGING_STEPS
 #   SAVE_STEPS
 #   USE_ORACLE            - set to 0 to disable oracle (ablation)
+#   MOSHI_SPEAKERS        - main (model) speaker(s): "A", "B" or "A B".
+#                           Empty -> finetune.py default ("A", the questioner).
+#                           Set "B" to train the model as the answerer.
+#   REPORT_TO             - experiment tracker: "wandb" enables W&B logging.
+#                           Empty -> no tracking (finetune.py default).
+#   PROJECT_NAME          - W&B project name (only used when REPORT_TO=wandb;
+#                           empty -> finetune.py default "kame-finetuning").
 #
 # Compute estimate:
 #   A100 80GB × 8  -> ~0.5–1 day  (50k sessions)
@@ -38,10 +45,23 @@ NUM_WARMUP_STEPS="${NUM_WARMUP_STEPS:-100}"
 LOGGING_STEPS="${LOGGING_STEPS:-10}"
 SAVE_STEPS="${SAVE_STEPS:-500}"
 USE_ORACLE="${USE_ORACLE:-1}"
+MOSHI_SPEAKERS="${MOSHI_SPEAKERS:-}"
+REPORT_TO="${REPORT_TO:-}"
+PROJECT_NAME="${PROJECT_NAME:-}"
 
 EXTRA_ARGS=()
 if [ "${USE_ORACLE}" = "1" ]; then
     EXTRA_ARGS+=(--use_oracle)
+fi
+if [ -n "${MOSHI_SPEAKERS}" ]; then
+    # Intentional word-splitting: "A B" -> two values for argparse nargs="+".
+    EXTRA_ARGS+=(--moshi_speakers ${MOSHI_SPEAKERS})
+fi
+if [ -n "${REPORT_TO}" ]; then
+    EXTRA_ARGS+=(--report_to "${REPORT_TO}")
+fi
+if [ -n "${PROJECT_NAME}" ]; then
+    EXTRA_ARGS+=(--project_name "${PROJECT_NAME}")
 fi
 
 uv run accelerate launch \

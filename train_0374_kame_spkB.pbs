@@ -1,0 +1,69 @@
+#!/bin/bash
+# =====================================================================
+# J-KAME finetune on ABCI 3.0 (LLM-jp) — model trained as SPEAKER B
+# (the answerer) instead of the default speaker A (the questioner).
+#
+# Why: with moshi_speakers=A the model learns the opener/questioner role
+# (A opens ~99% of dialogues) -> spontaneous opening + role mismatch.
+# Training as B teaches "wait for the user, then answer".
+#
+# The SAME parquet as the e5 A-run is reused: every row already stores
+# both the A and B streams (cols B, B_oracle_*), so NO new data transfer
+# is needed — only this .pbs and the updated finetune_j_moshi.sh.
+#
+# Submit from the experiment repo dir on a login node:
+#   cd /groups/gcg51557/experiments/0374_japanese_kame/moshi_kame_finetune
+#   qsub train_0374_kame_spkB.pbs
+#
+# Smoke first (1 epoch on a single 200-row parquet, a few minutes):
+#   qsub -v RTYPE=rt_HF,NUM_EPOCHS=1,\
+# TRAIN_DATA_GLOB=processed_data/japanese_kame/0610/batch_0000-001-of-001.parquet,\
+# OUTPUT_DIR=output/0374_kame-spkB-smoke train_0374_kame_spkB.pbs
+# =====================================================================
+#PBS -P gcg51557
+#PBS -q R9920261000
+#PBS -v RTYPE=rt_HF
+#PBS -l select=1
+#PBS -l walltime=04:00:00
+#PBS -N 0374_kame_spkB_e5
+#PBS -j oe
+
+set -euo pipefail
+
+# PBS starts the job in $HOME; move to the dir we submitted from (the repo).
+cd "${PBS_O_WORKDIR:-$(pwd)}"
+
+# --- compute-node environment (see the "ABCI training workflow" memo) ---
+source /etc/profile.d/modules.sh 2>/dev/null || true
+module load cuda/12.1                  # CUDA_HOME for DeepSpeed's nvcc (cu121)
+export PATH="$HOME/.local/bin:$PATH"   # uv is not on PATH on compute nodes
+export WANDB_MODE=offline
+
+# --- sanity: confirm we are on a GPU compute node (hnodeXXX), not a login node ---
+echo "host: $(hostname)"
+nvidia-smi -L || { echo "NO GPU visible — are you on a login node?"; exit 1; }
+
+# --- training config (mirrors the e5 A-run; only speaker + output differ) ---
+export MOSHI_SPEAKERS="${MOSHI_SPEAKERS:-B}"
+export TRAIN_DATA_GLOB="${TRAIN_DATA_GLOB:-processed_data/japanese_kame/0610/batch_*.parquet}"
+export MODEL_DIR="${MODEL_DIR:-init_models/j-moshi-ext-four_streams-bfloat16}"
+export OUTPUT_DIR="${OUTPUT_DIR:-output/0374_kame-0610-e5-spkB}"
+export DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-ds_configs/zero3-bfp16-warmlr-act_ckpt.json}"
+export NUM_PROCESSES="${NUM_PROCESSES:-8}"
+export NUM_EPOCHS="${NUM_EPOCHS:-5}"
+export PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
+export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+export NUM_WARMUP_STEPS="${NUM_WARMUP_STEPS:-100}"
+export LOGGING_STEPS="${LOGGING_STEPS:-10}"
+export SAVE_STEPS="${SAVE_STEPS:-500}"
+export USE_ORACLE="${USE_ORACLE:-1}"
+
+mkdir -p "${OUTPUT_DIR}"
+
+echo "=== J-KAME finetune | main speaker = ${MOSHI_SPEAKERS} ==="
+echo "data   : ${TRAIN_DATA_GLOB}"
+echo "init   : ${MODEL_DIR}"
+echo "output : ${OUTPUT_DIR}"
+echo "epochs : ${NUM_EPOCHS} | per_device_bs=${PER_DEVICE_BATCH_SIZE} x ${NUM_PROCESSES} gpu | use_oracle=${USE_ORACLE}"
+
+bash examples/finetune_j_moshi.sh
